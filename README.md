@@ -82,3 +82,10 @@ To check real OS file/folder pickers and system appearance manually on each targ
 ```
 
 This opens the app with synthetic logs under `build/native-smoke`, without reading personal Codex conversations. Check **Add log folder…**, a single-selection export, a multiple-selection export, and dismissal of each picker. Verify the packaged launcher on each target OS as well. Cross-building an archive does not verify its runtime behavior on that OS.
+
+## License
+
+Copyright 2026 Dmitrii Sapelkin (Dimage).
+
+Licensed under the Apache License, Version 2.0.
+See [LICENSE](LICENSE) for details.

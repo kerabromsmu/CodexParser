@@ -1,319 +1,289 @@
 package se.dimage.codexparser;
 
-import javax.swing.BorderFactory;
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.JButton;
-import javax.swing.JComboBox;
-import javax.swing.JFileChooser;
-import javax.swing.JFrame;
-import javax.swing.JLabel;
-import javax.swing.JOptionPane;
-import javax.swing.JPanel;
-import javax.swing.JProgressBar;
-import javax.swing.JScrollPane;
-import javax.swing.JSplitPane;
-import javax.swing.JTable;
-import javax.swing.JTextArea;
-import javax.swing.JTextField;
-import javax.swing.ListSelectionModel;
-import javax.swing.RowFilter;
-import javax.swing.SwingUtilities;
-import javax.swing.SwingWorker;
-import javax.swing.Timer;
-import javax.swing.UIManager;
-import javax.swing.event.DocumentEvent;
-import javax.swing.event.DocumentListener;
-import javax.swing.filechooser.FileNameExtensionFilter;
-import javax.swing.table.AbstractTableModel;
-import javax.swing.table.TableRowSorter;
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.FlowLayout;
-import java.awt.Font;
-import java.awt.GraphicsEnvironment;
-import java.awt.event.WindowAdapter;
-import java.awt.event.WindowEvent;
+import org.eclipse.swt.SWT;
+import org.eclipse.swt.SWTError;
+import org.eclipse.swt.SWTException;
+import org.eclipse.swt.custom.SashForm;
+import org.eclipse.swt.graphics.Font;
+import org.eclipse.swt.graphics.FontData;
+import org.eclipse.swt.layout.GridData;
+import org.eclipse.swt.layout.GridLayout;
+import org.eclipse.swt.widgets.Button;
+import org.eclipse.swt.widgets.Combo;
+import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.widgets.Control;
+import org.eclipse.swt.widgets.Display;
+import org.eclipse.swt.widgets.Label;
+import org.eclipse.swt.widgets.ProgressBar;
+import org.eclipse.swt.widgets.Shell;
+import org.eclipse.swt.widgets.Table;
+import org.eclipse.swt.widgets.TableColumn;
+import org.eclipse.swt.widgets.TableItem;
+import org.eclipse.swt.widgets.Text;
+
 import java.nio.file.Path;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
-public final class CodexParserApp extends JFrame {
+public final class CodexParserApp {
+    private final Display display;
+    private final Shell shell;
+    private final DesktopDialogs dialogs;
     private final List<Path> roots;
-    private final ConversationTable model = new ConversationTable();
-    private final JTable table = new JTable(model) {
-        @Override
-        public String getToolTipText(java.awt.event.MouseEvent event) {
-            int row = rowAtPoint(event.getPoint());
-            return row < 0 ? null : model.rows.get(convertRowIndexToModel(row)).source().toString();
-        }
-    };
-    private final TableRowSorter<ConversationTable> sorter = new TableRowSorter<>(model);
-    private final JTextField search = new JTextField(24);
-    private final JTextArea preview = new JTextArea();
-    private final JComboBox<ExportOptions.Mode> mode = new JComboBox<>(ExportOptions.Mode.values());
-    private final JComboBox<String> timezone = new JComboBox<>(new String[]{"Local (" + ZoneId.systemDefault() + ")", "UTC"});
-    private final JButton refresh = new JButton("Refresh");
-    private final JButton addFolder = new JButton("Add log folder…");
-    private final JButton export = new JButton("Export selected…");
-    private final JButton cancel = new JButton("Cancel");
-    private final JButton warnings = new JButton("Warnings");
-    private final JLabel status = new JLabel("Ready");
-    private final JLabel selection = new JLabel("0 selected");
-    private final JLabel sources = new JLabel();
-    private final JLabel searchStatus = new JLabel(" ");
-    private final JLabel previewCaption = new JLabel("MARKDOWN PREVIEW");
-    private final JProgressBar progress = new JProgressBar();
-    private final Timer previewTimer;
-    private final Timer searchTimer;
+    private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
+    private Table table;
+    private Text search;
+    private Text preview;
+    private Combo mode;
+    private Combo timezone;
+    private Button refresh;
+    private Button addFolder;
+    private Button export;
+    private Button cancel;
+    private Button warnings;
+    private Label status;
+    private Label selection;
+    private Label sources;
+    private Label searchStatus;
+    private Label previewCaption;
+    private ProgressBar progress;
+    private List<Conversation> conversations = List.of();
     private List<String> scanWarnings = List.of();
     private List<String> searchWarnings = List.of();
     private Set<Path> contentMatches = Set.of();
-    private SwingWorker<ConversationSearch.SearchResult, Void> searchWorker;
-    private AtomicBoolean searchCancelled;
-    private SwingWorker<ConversationDiscovery.ScanResult, String> scanWorker;
-    private AtomicBoolean scanCancelled;
-    private SwingWorker<MarkdownExporter.Preview, Void> previewWorker;
-    private SwingWorker<ExportService.BatchResult, String> exportWorker;
-    private AtomicBoolean exportCancelled;
+    private Operation searchOperation;
+    private Operation scanOperation;
+    private Operation previewOperation;
+    private Operation exportOperation;
+    private Path focusedSource;
+    private int sortColumn = -1;
+    private boolean sortAscending = true;
     private boolean closeWhenFinished;
+    private final Runnable previewTimer = this::loadPreview;
+    private final Runnable searchTimer = this::searchContents;
 
     static void main() {
-        if (GraphicsEnvironment.isHeadless()) {
-            System.err.println("Codex Parser needs a graphical desktop. Start it from a desktop session.");
+        Display display;
+        try {
+            Display.setAppName("Codex Parser");
+            display = new Display();
+        } catch (SWTError | UnsatisfiedLinkError error) {
+            System.err.println("Codex Parser could not open the native desktop. Check the display and SWT platform libraries.\n" + error.getMessage());
             return;
         }
-        SwingUtilities.invokeLater(() -> {
-            try {
-                for (var theme : UIManager.getInstalledLookAndFeels()) {
-                    if (theme.getName().equals("Nimbus")) {
-                        UIManager.setLookAndFeel(theme.getClassName());
-                        break;
-                    }
-                }
-                UIManager.put("defaultFont", new Font(Font.SANS_SERIF, Font.PLAIN, 13));
-            } catch (Exception ignored) {
-                // Swing's default look and feel remains usable.
+        try {
+            var app = new CodexParserApp(display, ConversationDiscovery.defaultRoots(), new DesktopDialogs.Native());
+            app.open();
+            while (!app.shell.isDisposed()) {
+                if (!display.readAndDispatch()) display.sleep();
             }
-            var app = new CodexParserApp();
-            app.setVisible(true);
-            app.refreshConversations();
-        });
+        } finally {
+            display.dispose();
+        }
     }
 
-    public CodexParserApp() {
-        this(ConversationDiscovery.defaultRoots());
-    }
-
-    CodexParserApp(List<Path> initialRoots) {
-        super("Codex Parser — Conversation Exporter");
+    CodexParserApp(Display display, List<Path> initialRoots, DesktopDialogs dialogs) {
+        this.display = display;
+        this.dialogs = dialogs;
         roots = new ArrayList<>(initialRoots);
-        setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
-        setMinimumSize(new Dimension(950, 600));
-        setSize(1350, 850);
-        setLocationRelativeTo(null);
-        previewTimer = new Timer(150, _ -> loadPreview());
-        previewTimer.setRepeats(false);
-        searchTimer = new Timer(300, _ -> searchContents());
-        searchTimer.setRepeats(false);
+        shell = new Shell(display);
+        shell.setText("Codex Parser — Conversation Exporter");
+        shell.setMinimumSize(950, 600);
+        var bounds = display.getPrimaryMonitor().getClientArea();
+        shell.setSize(Math.min(1350, bounds.width), Math.min(850, bounds.height));
+        shell.setLocation(bounds.x + Math.max(0, (bounds.width - shell.getSize().x) / 2),
+                bounds.y + Math.max(0, (bounds.height - shell.getSize().y) / 2));
         buildInterface();
         wireActions();
         updateSources();
         updateActions();
-        addWindowListener(new WindowAdapter() {
-            @Override
-            public void windowClosing(WindowEvent event) {
-                previewTimer.stop();
-                cancelContentSearch();
-                if (previewWorker != null) previewWorker.cancel(true);
-                if (scanWorker != null) scanCancelled.set(true);
-                if (exportWorker != null) {
-                    closeWhenFinished = true;
-                    exportCancelled.set(true);
-                    status.setText("Finishing cancellation before closing…");
-                } else dispose();
+        shell.addListener(SWT.Close, event -> {
+            stopReading();
+            if (exportOperation != null) {
+                event.doit = false;
+                closeWhenFinished = true;
+                exportOperation.cancelled.set(true);
+                status.setText("Finishing cancellation before closing…");
+                updateActions();
             }
-
-            @Override
-            public void windowClosed(WindowEvent event) {
-                cancelContentSearch();
-            }
+        });
+        shell.addListener(SWT.Dispose, _ -> {
+            stopReading();
+            if (exportOperation != null) exportOperation.cancelled.set(true);
+            workers.shutdown();
         });
     }
 
+    void open() {
+        shell.open();
+        refreshConversations();
+    }
+
+    Shell shell() {
+        return shell;
+    }
+
+    private static Composite row(Composite parent, int columns) {
+        var result = new Composite(parent, SWT.NONE);
+        var layout = new GridLayout(columns, false);
+        layout.marginWidth = 0;
+        layout.marginHeight = 0;
+        layout.horizontalSpacing = 8;
+        result.setLayout(layout);
+        result.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+        return result;
+    }
+
+    private static Label label(Composite parent, String text) {
+        var label = new Label(parent, SWT.NONE);
+        label.setText(text);
+        return label;
+    }
+
+    private static Button button(Composite parent, String text) {
+        var button = new Button(parent, SWT.PUSH);
+        button.setText(text);
+        return button;
+    }
+
     private void buildInterface() {
-        var content = new JPanel(new BorderLayout(0, 16));
-        content.setBorder(BorderFactory.createEmptyBorder(22, 24, 16, 24));
-        setContentPane(content);
+        var layout = new GridLayout();
+        layout.marginWidth = 20;
+        layout.marginHeight = 16;
+        layout.verticalSpacing = 12;
+        shell.setLayout(layout);
+        label(shell, "Codex conversations");
+        label(shell, "Browse your local sessions. Export a readable Markdown transcript.");
+        var sourceRow = row(shell, 3);
+        sources = label(sourceRow, "");
+        sources.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+        addFolder = button(sourceRow, "Add log folder…");
+        refresh = button(sourceRow, "Refresh");
 
-        var heading = new JPanel();
-        heading.setLayout(new BoxLayout(heading, BoxLayout.Y_AXIS));
-        var title = new JLabel("Codex conversations");
-        title.setFont(title.getFont().deriveFont(Font.BOLD, 27f));
-        var subtitle = new JLabel("Browse your local sessions. Export a readable Markdown transcript.");
-        subtitle.setForeground(new Color(90, 100, 110));
-        heading.add(title);
-        heading.add(Box.createVerticalStrut(7));
-        heading.add(subtitle);
-        heading.add(Box.createVerticalStrut(14));
-
-        var sourceRow = new JPanel(new BorderLayout(10, 0));
-        var sourceActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
-        sourceActions.add(addFolder);
-        sourceActions.add(refresh);
-        sourceRow.add(sources, BorderLayout.CENTER);
-        sourceRow.add(sourceActions, BorderLayout.EAST);
-        sourceRow.setAlignmentX(LEFT_ALIGNMENT);
-        heading.add(sourceRow);
-        content.add(heading, BorderLayout.NORTH);
-
-        table.setRowSorter(sorter);
-        table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
-        table.setRowHeight(34);
-        table.setShowGrid(false);
-        table.setFillsViewportHeight(true);
-        table.getTableHeader().setReorderingAllowed(false);
-        table.getColumnModel().getColumn(0).setPreferredWidth(320);
-        table.getColumnModel().getColumn(1).setPreferredWidth(220);
-        table.getColumnModel().getColumn(2).setPreferredWidth(160);
-        table.getColumnModel().getColumn(3).setPreferredWidth(70);
-
-        var browse = new JPanel(new BorderLayout(0, 10));
-        var filter = new JPanel(new BorderLayout(8, 0));
-        filter.add(new JLabel("Search"), BorderLayout.WEST);
+        var split = new SashForm(shell, SWT.HORIZONTAL);
+        split.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, true));
+        var browse = new Composite(split, SWT.NONE);
+        browse.setLayout(new GridLayout());
+        var filter = row(browse, 2);
+        label(filter, "Search");
+        search = new Text(filter, SWT.SEARCH | SWT.ICON_SEARCH | SWT.ICON_CANCEL);
+        search.setData("name", "search");
+        search.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
         search.setToolTipText("Search titles, projects, session IDs, paths, and user/assistant messages (including code)");
-        search.setName("search");
-        filter.add(search, BorderLayout.CENTER);
-        searchStatus.setName("searchStatus");
-        searchStatus.setFont(searchStatus.getFont().deriveFont(11f));
-        searchStatus.setForeground(new Color(90, 100, 110));
-        filter.add(searchStatus, BorderLayout.SOUTH);
-        browse.add(filter, BorderLayout.NORTH);
-        browse.add(new JScrollPane(table), BorderLayout.CENTER);
-        var listHelp = new JLabel("Ctrl / Cmd + click to select several; Shift + click to select a range.");
-        listHelp.setFont(listHelp.getFont().deriveFont(11f));
-        browse.add(listHelp, BorderLayout.SOUTH);
-
-        preview.setEditable(false);
-        preview.setName("preview");
-        preview.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-        preview.setLineWrap(true);
-        preview.setWrapStyleWord(true);
-        preview.setMargin(new java.awt.Insets(14, 14, 14, 14));
+        searchStatus = label(browse, " ");
+        searchStatus.setData("name", "searchStatus");
+        searchStatus.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+        table = new Table(browse, SWT.MULTI | SWT.FULL_SELECTION | SWT.BORDER | SWT.V_SCROLL | SWT.H_SCROLL);
+        table.setHeaderVisible(true);
+        table.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, true));
+        String[] columns = {"Conversation", "Started", "Project", "Location"};
+        int[] widths = {300, 220, 160, 90};
+        for (int i = 0; i < columns.length; i++) {
+            var column = new TableColumn(table, SWT.NONE);
+            column.setText(columns[i]);
+            column.setWidth(widths[i]);
+            final int index = i;
+            column.addListener(SWT.Selection, _ -> {
+                sortAscending = sortColumn != index || !sortAscending;
+                sortColumn = index;
+                table.setSortColumn(column);
+                table.setSortDirection(sortAscending ? SWT.UP : SWT.DOWN);
+                applyFilter();
+            });
+        }
+        label(browse, "Ctrl / Cmd + click to select several; Shift + click to select a range.");
+        var previewPanel = new Composite(split, SWT.NONE);
+        previewPanel.setLayout(new GridLayout());
+        previewCaption = label(previewPanel, "MARKDOWN PREVIEW");
+        previewCaption.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+        preview = new Text(previewPanel, SWT.MULTI | SWT.READ_ONLY | SWT.WRAP | SWT.V_SCROLL | SWT.BORDER);
+        preview.setData("name", "preview");
+        preview.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, true));
+        String family = switch (SWT.getPlatform()) {
+            case "win32" -> "Consolas";
+            case "cocoa" -> "Menlo";
+            default -> "Monospace";
+        };
+        var font = new Font(display, new FontData(family, preview.getFont().getFontData()[0].getHeight(), SWT.NORMAL));
+        preview.setFont(font);
+        preview.addListener(SWT.Dispose, _ -> font.dispose());
         preview.setText("Select a conversation to preview its Markdown export.");
-        var previewPanel = new JPanel(new BorderLayout(0, 10));
-        previewCaption.setFont(previewCaption.getFont().deriveFont(Font.BOLD, 11f));
-        previewPanel.add(previewCaption, BorderLayout.NORTH);
-        previewPanel.add(new JScrollPane(preview), BorderLayout.CENTER);
-        var split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, browse, previewPanel);
-        split.setResizeWeight(0.55);
-        split.setDividerLocation(690);
-        split.setBorder(BorderFactory.createEmptyBorder());
-        browse.setMinimumSize(new Dimension(350, 100));
-        previewPanel.setMinimumSize(new Dimension(300, 100));
-        content.add(split, BorderLayout.CENTER);
+        split.setWeights(55, 45);
 
-        var footer = new JPanel(new BorderLayout(0, 12));
-        var options = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        options.add(new JLabel("Include"));
-        options.add(mode);
+        var options = row(shell, 5);
+        label(options, "Include");
+        mode = new Combo(options, SWT.DROP_DOWN | SWT.READ_ONLY);
+        mode.setItems(Arrays.stream(ExportOptions.Mode.values()).map(Object::toString).toArray(String[]::new));
+        mode.select(0);
         mode.setToolTipText("Everything also includes instructions, tool activity, metadata, and original JSON records");
-        options.add(Box.createHorizontalStrut(8));
-        options.add(new JLabel("Timestamps"));
-        options.add(timezone);
-        var exportRow = new JPanel(new BorderLayout(8, 0));
-        exportRow.add(options, BorderLayout.CENTER);
-        exportRow.add(export, BorderLayout.EAST);
-        export.setBackground(new Color(30, 112, 100));
-        export.setForeground(Color.WHITE);
-        footer.add(exportRow, BorderLayout.NORTH);
-
-        var statusRow = new JPanel(new BorderLayout(8, 0));
-        statusRow.add(status, BorderLayout.CENTER);
-        var indicators = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
-        progress.setPreferredSize(new Dimension(85, 12));
-        progress.setIndeterminate(true);
-        indicators.add(warnings);
-        indicators.add(selection);
-        indicators.add(progress);
-        indicators.add(cancel);
-        statusRow.add(indicators, BorderLayout.EAST);
-        footer.add(statusRow, BorderLayout.SOUTH);
-        content.add(footer, BorderLayout.SOUTH);
-        warnings.setVisible(false);
+        label(options, "Timestamps");
+        timezone = new Combo(options, SWT.DROP_DOWN | SWT.READ_ONLY);
+        timezone.setItems("Local (" + ZoneId.systemDefault() + ")", "UTC");
+        timezone.select(0);
+        export = button(options, "Export selected…");
+        export.setLayoutData(new GridData(SWT.END, SWT.CENTER, true, false));
+        var statusRow = row(shell, 5);
+        status = label(statusRow, "Ready");
+        status.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+        warnings = button(statusRow, "Warnings");
+        selection = label(statusRow, "0 selected");
+        progress = new ProgressBar(statusRow, SWT.INDETERMINATE);
+        var progressData = new GridData(SWT.CENTER, SWT.CENTER, false, false);
+        progressData.widthHint = 85;
+        progress.setLayoutData(progressData);
+        cancel = button(statusRow, "Cancel");
     }
 
     private void wireActions() {
-        refresh.addActionListener(_ -> refreshConversations());
-        addFolder.addActionListener(_ -> {
-            var chooser = new JFileChooser();
-            chooser.setDialogTitle("Choose a Codex home or a folder with .jsonl or .jsonl.zst conversations");
-            chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-            if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
-                Path folder = chooser.getSelectedFile().toPath().toAbsolutePath();
+        refresh.addListener(SWT.Selection, _ -> refreshConversations());
+        addFolder.addListener(SWT.Selection, _ -> {
+            Path folder = dialogs.chooseDirectory(shell, "Choose a Codex home or a folder with .jsonl or .jsonl.zst conversations");
+            if (folder != null) {
+                folder = folder.toAbsolutePath().normalize();
                 if (!roots.contains(folder)) roots.add(folder);
                 updateSources();
                 refreshConversations();
             }
         });
-        search.getDocument().addDocumentListener(new DocumentListener() {
-            @Override
-            public void insertUpdate(DocumentEvent event) {
-                filter();
-            }
-
-            @Override
-            public void removeUpdate(DocumentEvent event) {
-                filter();
-            }
-
-            @Override
-            public void changedUpdate(DocumentEvent event) {
-                filter();
-            }
+        search.addModifyListener(_ -> filter());
+        table.addListener(SWT.Selection, event -> {
+            if (event.item instanceof TableItem item) focusedSource = ((Conversation) item.getData()).source();
+            updateActions();
+            schedulePreview();
         });
-        table.getSelectionModel().addListSelectionListener(event -> {
-            if (!event.getValueIsAdjusting()) {
-                updateActions();
-                previewTimer.restart();
-            }
+        table.addListener(SWT.MouseMove, event -> {
+            TableItem item = table.getItem(new org.eclipse.swt.graphics.Point(event.x, event.y));
+            table.setToolTipText(item == null ? null : ((Conversation) item.getData()).source().toString());
         });
-        mode.addActionListener(_ -> previewTimer.restart());
-        timezone.addActionListener(_ -> {
-            model.zone = options().zone();
-            // Preserve selection while updating timestamp cells and any active date sort.
-            var selected = selectedConversations();
-            model.fireTableDataChanged();
-            for (Conversation conversation : selected) {
-                int index = model.rows.indexOf(conversation);
-                int view = index < 0 ? -1 : table.convertRowIndexToView(index);
-                if (view >= 0) table.addRowSelectionInterval(view, view);
-            }
-            previewTimer.restart();
-        });
-        export.addActionListener(_ -> chooseExport());
-        cancel.addActionListener(_ -> {
-            if (scanWorker != null) {
-                scanCancelled.set(true);
+        mode.addListener(SWT.Selection, _ -> schedulePreview());
+        timezone.addListener(SWT.Selection, _ -> applyFilter());
+        export.addListener(SWT.Selection, _ -> chooseExport());
+        cancel.addListener(SWT.Selection, _ -> {
+            if (scanOperation != null) {
+                scanOperation.cancelled.set(true);
                 status.setText("Cancelling scan…");
-                cancel.setEnabled(false);
             }
-            if (exportWorker != null) {
-                exportCancelled.set(true);
+            if (exportOperation != null) {
+                exportOperation.cancelled.set(true);
                 status.setText("Cancelling export…");
-                cancel.setEnabled(false);
             }
+            cancel.setEnabled(false);
         });
-        warnings.addActionListener(_ -> {
+        warnings.addListener(SWT.Selection, _ -> {
             var messages = new ArrayList<>(scanWarnings);
             messages.addAll(searchWarnings);
-            showText("Log warnings", String.join("\n", messages));
+            dialogs.showText(shell, "Log warnings", String.join("\n", messages));
         });
     }
 
@@ -325,254 +295,249 @@ public final class CodexParserApp extends JFrame {
         applyFilter();
         if (ConversationSearch.normalizeQuery(search.getText()).isEmpty()) {
             searchStatus.setText(" ");
-        } else if (scanWorker != null) {
+        } else if (scanOperation != null) {
             searchStatus.setText("Waiting for conversations…");
         } else {
             searchStatus.setText("Searching chat contents…");
-            searchTimer.restart();
+            display.timerExec(300, searchTimer);
         }
     }
 
     private void applyFilter() {
+        Set<Path> selected = selectedConversations().stream().map(Conversation::source).collect(Collectors.toSet());
         String query = ConversationSearch.normalizeQuery(search.getText());
-        Set<Path> matches = contentMatches;
-        sorter.setRowFilter(new RowFilter<>() {
-            @Override
-            public boolean include(Entry<? extends ConversationTable, ? extends Integer> entry) {
-                Conversation row = model.rows.get(entry.getIdentifier());
-                return ConversationSearch.matchesMetadata(row, query) || matches.contains(row.source());
+        var visible = new ArrayList<>(conversations.stream()
+                .filter(c -> ConversationSearch.matchesMetadata(c, query) || contentMatches.contains(c.source())).toList());
+        if (sortColumn >= 0) {
+            // Sort by displayed cell values, including formatted timestamps.
+            Comparator<Conversation> comparator = Comparator.comparing(c -> cells(c)[sortColumn]);
+            visible.sort(sortAscending ? comparator : comparator.reversed());
+        }
+        table.setRedraw(false);
+        try {
+            table.removeAll();
+            for (Conversation conversation : visible) {
+                var item = new TableItem(table, SWT.NONE);
+                item.setData(conversation);
+                item.setText(cells(conversation));
+                if (selected.contains(conversation.source())) table.select(table.indexOf(item));
             }
-        });
+        } finally {
+            table.setRedraw(true);
+        }
         updateActions();
-        previewTimer.restart();
+        schedulePreview();
+    }
+
+    private String[] cells(Conversation conversation) {
+        return new String[]{conversation.title(), MarkdownExporter.timestamp(conversation.startedAt(), options().zone()),
+                conversation.project().isBlank() ? "Unknown" : conversation.project(),
+                conversation.archived() ? "Archived" : "Sessions"};
     }
 
     private void cancelContentSearch() {
-        searchTimer.stop();
-        if (searchCancelled != null) searchCancelled.set(true);
-        searchWorker = null;
+        display.timerExec(-1, searchTimer);
+        if (searchOperation != null) searchOperation.cancelled.set(true);
+        searchOperation = null;
     }
 
     private void searchContents() {
         String query = ConversationSearch.normalizeQuery(search.getText());
-        if (query.isEmpty() || scanWorker != null || !isDisplayable()) return;
-        List<Conversation> conversations = List.copyOf(model.rows);
-        searchCancelled = new AtomicBoolean();
-        AtomicBoolean cancellation = searchCancelled;
-        searchWorker = new SwingWorker<>() {
-            @Override
-            protected ConversationSearch.SearchResult doInBackground() {
-                return new ConversationSearch().search(conversations, query, cancellation::get);
-            }
+        if (query.isEmpty() || scanOperation != null || closeWhenFinished) return;
+        var snapshot = List.copyOf(conversations);
+        var operation = new Operation();
+        searchOperation = operation;
+        submit(() -> new ConversationSearch().search(snapshot, query, operation.cancelled::get), result -> {
+            if (searchOperation != operation || operation.cancelled.get()) return;
+            searchOperation = null;
+            contentMatches = result.matches();
+            searchWarnings = result.warnings();
+            applyFilter();
+            searchStatus.setText("Search complete — " + table.getItemCount() + " conversation(s)"
+                    + (searchWarnings.isEmpty() ? "" : "; " + searchWarnings.size() + " warning(s)"));
+            updateWarnings();
+        }, error -> {
+            if (searchOperation != operation || operation.cancelled.get()) return;
+            searchOperation = null;
+            searchWarnings = List.of("Content search failed: " + error.getMessage());
+            searchStatus.setText("Content search failed; showing metadata matches.");
+            updateWarnings();
+        });
+    }
 
-            @Override
-            protected void done() {
-                if (searchWorker != this || cancellation.get() || !isDisplayable()) return;
-                try {
-                    var result = get();
-                    contentMatches = result.matches();
-                    searchWarnings = result.warnings();
-                    applyFilter();
-                    searchStatus.setText("Search complete — " + table.getRowCount() + " conversation(s)"
-                            + (searchWarnings.isEmpty() ? "" : "; " + searchWarnings.size() + " warning(s)"));
-                } catch (CancellationException ignored) {
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } catch (ExecutionException e) {
-                    if (!(e.getCause() instanceof CancellationException)) {
-                        searchWarnings = List.of("Content search failed: " + e.getCause().getMessage());
-                        searchStatus.setText("Content search failed; showing metadata matches.");
-                    }
-                } finally {
-                    searchWorker = null;
-                    updateWarnings();
-                }
-            }
-        };
-        searchWorker.execute();
+    private ExportOptions options() {
+        return new ExportOptions(ExportOptions.Mode.values()[mode.getSelectionIndex()],
+                timezone.getSelectionIndex() == 1 ? ZoneId.of("UTC") : ZoneId.systemDefault());
+    }
+
+    private List<Conversation> selectedConversations() {
+        return Arrays.stream(table.getSelection()).map(item -> (Conversation) item.getData()).toList();
+    }
+
+    private void updateActions() {
+        boolean busy = scanOperation != null || exportOperation != null;
+        refresh.setEnabled(!busy && !closeWhenFinished);
+        addFolder.setEnabled(!busy && !closeWhenFinished);
+        export.setEnabled(!busy && !closeWhenFinished && table.getSelectionCount() > 0);
+        visible(cancel, busy);
+        cancel.setEnabled(busy && !closeWhenFinished);
+        visible(progress, busy);
+        selection.setText(table.getItemCount() + " shown · " + table.getSelectionCount() + " selected");
+        shell.layout(true, true);
+    }
+
+    private static void visible(Control control, boolean visible) {
+        control.setVisible(visible);
+        if (control.getLayoutData() == null) control.setLayoutData(new GridData());
+        ((GridData) control.getLayoutData()).exclude = !visible;
     }
 
     private void updateWarnings() {
         int count = scanWarnings.size() + searchWarnings.size();
         warnings.setText("Warnings (" + count + ")");
-        warnings.setVisible(count > 0);
-    }
-
-    private ExportOptions options() {
-        return new ExportOptions((ExportOptions.Mode) mode.getSelectedItem(),
-                timezone.getSelectedIndex() == 1 ? ZoneId.of("UTC") : ZoneId.systemDefault());
-    }
-
-    private List<Conversation> selectedConversations() {
-        var selected = new ArrayList<Conversation>();
-        for (int view : table.getSelectedRows()) selected.add(model.rows.get(table.convertRowIndexToModel(view)));
-        return List.copyOf(selected);
-    }
-
-    private void updateActions() {
-        boolean busy = scanWorker != null || exportWorker != null;
-        refresh.setEnabled(!busy);
-        addFolder.setEnabled(!busy);
-        export.setEnabled(!busy && table.getSelectedRowCount() > 0);
-        cancel.setVisible(busy);
-        cancel.setEnabled(busy);
-        progress.setVisible(busy);
-        selection.setText(table.getRowCount() + " shown · " + table.getSelectedRowCount() + " selected");
+        visible(warnings, count > 0);
+        shell.layout(true, true);
     }
 
     private void updateSources() {
         sources.setText(roots.size() + " log location" + (roots.size() == 1 ? "" : "s"));
         sources.setToolTipText(roots.toString());
+        updateWarnings();
     }
 
     private void refreshConversations() {
-        if (scanWorker != null || exportWorker != null) return;
+        if (scanOperation != null || exportOperation != null || closeWhenFinished) return;
         cancelContentSearch();
-        if (!ConversationSearch.normalizeQuery(search.getText()).isEmpty()) {
-            searchStatus.setText("Waiting for conversations…");
-        }
+        if (!ConversationSearch.normalizeQuery(search.getText()).isEmpty()) searchStatus.setText("Waiting for conversations…");
         status.setText("Finding conversations…");
-        var scanRoots = List.copyOf(roots);
-        // Keep queued workers runnable so cancellation before startup still reaches done().
-        scanCancelled = new AtomicBoolean();
-        AtomicBoolean cancellation = scanCancelled;
-        scanWorker = new SwingWorker<>() {
-            @Override
-            protected ConversationDiscovery.ScanResult doInBackground() {
-                try {
-                    return new ConversationDiscovery().scan(scanRoots, cancellation::get, this::publish);
-                } catch (CancellationException e) {
-                    return new ConversationDiscovery.ScanResult(List.of(), List.of());
-                }
-            }
-
-            @Override
-            protected void process(List<String> chunks) {
-                if (scanWorker == this && !cancellation.get()) status.setText(chunks.getLast());
-            }
-
-            @Override
-            protected void done() {
-                try {
-                    var result = get();
-                    if (cancellation.get()) {
-                        status.setText("Scan cancelled.");
-                        return;
-                    }
-                    model.rows = result.conversations();
-                    model.fireTableDataChanged();
-                    scanWarnings = result.warnings();
-                    status.setText(model.rows.isEmpty() ? "No conversations found. Add a log folder to search elsewhere."
-                            : "Found " + model.rows.size() + " conversations. Select one to preview.");
-                } catch (CancellationException e) {
-                    status.setText("Scan cancelled.");
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } catch (ExecutionException e) {
-                    status.setText("Scan failed.");
-                    showError("Could not scan logs", e.getCause());
-                } finally {
-                    scanWorker = null;
-                    updateActions();
-                    if (isDisplayable()) filter();
-                }
-            }
-        };
+        var snapshot = List.copyOf(roots);
+        var operation = new Operation();
+        scanOperation = operation;
         updateActions();
-        scanWorker.execute();
+        submit(() -> new ConversationDiscovery().scan(snapshot, operation.cancelled::get,
+                text -> post(() -> {
+                    if (scanOperation == operation && !operation.cancelled.get()) status.setText(text);
+                })), result -> finishScan(operation, result, null), error -> finishScan(operation, null, error));
+    }
+
+    private void finishScan(Operation operation, ConversationDiscovery.ScanResult result, Exception error) {
+        if (scanOperation != operation) return;
+        scanOperation = null;
+        if (operation.cancelled.get() || error instanceof CancellationException) {
+            status.setText("Scan cancelled.");
+        } else if (error != null) {
+            status.setText("Scan failed.");
+        } else {
+            conversations = result.conversations();
+            scanWarnings = result.warnings();
+            status.setText(conversations.isEmpty() ? "No conversations found. Add a log folder to search elsewhere."
+                    : "Found " + conversations.size() + " conversations. Select one to preview.");
+        }
+        updateActions();
+        if (!closeWhenFinished) filter();
+        if (error != null && !(error instanceof CancellationException) && !operation.cancelled.get())
+            dialogs.showError(shell, "Could not scan logs", error);
+    }
+
+    private void schedulePreview() {
+        if (previewOperation != null) previewOperation.cancelled.set(true);
+        previewOperation = null;
+        display.timerExec(-1, previewTimer);
+        if (!closeWhenFinished) display.timerExec(150, previewTimer);
     }
 
     private void loadPreview() {
-        if (previewWorker != null) previewWorker.cancel(true);
         var selected = selectedConversations();
+        previewCaption.setText("MARKDOWN PREVIEW");
         if (selected.isEmpty()) {
-            previewWorker = null;
-            previewCaption.setText("MARKDOWN PREVIEW");
             preview.setText("Select a conversation to preview its Markdown export.");
             return;
         }
-        int lead = table.getSelectionModel().getLeadSelectionIndex();
-        Conversation conversation = lead >= 0 && lead < table.getRowCount() && table.isRowSelected(lead)
-                ? model.rows.get(table.convertRowIndexToModel(lead)) : selected.getFirst();
+        Conversation conversation = selected.stream().filter(c -> c.source().equals(focusedSource)).findFirst().orElse(selected.getFirst());
         ExportOptions currentOptions = options();
         preview.setText("Loading Markdown preview…");
-        previewCaption.setText("MARKDOWN PREVIEW");
-        previewWorker = new SwingWorker<>() {
-            @Override
-            protected MarkdownExporter.Preview doInBackground() throws Exception {
-                return new MarkdownExporter().preview(conversation, currentOptions, this::isCancelled);
-            }
-
-            @Override
-            protected void done() {
-                if (previewWorker != this) return;
-                try {
-                    var result = get();
-                    preview.setText(result.text());
-                    preview.setCaretPosition(0);
-                    previewCaption.setText(result.truncated() ? "MARKDOWN PREVIEW · TRUNCATED — EXPORT INCLUDES ALL CONTENT"
-                            : "MARKDOWN PREVIEW");
-                } catch (CancellationException ignored) {
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } catch (ExecutionException e) {
-                    preview.setText("Could not preview this conversation:\n" + e.getCause().getMessage());
-                }
-            }
-        };
-        previewWorker.execute();
+        var operation = new Operation();
+        previewOperation = operation;
+        submit(() -> new MarkdownExporter().preview(conversation, currentOptions, operation.cancelled::get), result -> {
+            if (previewOperation != operation || operation.cancelled.get()) return;
+            previewOperation = null;
+            preview.setText(result.text());
+            preview.setSelection(0);
+            previewCaption.setText(result.truncated() ? "MARKDOWN PREVIEW · TRUNCATED — EXPORT INCLUDES ALL CONTENT" : "MARKDOWN PREVIEW");
+            previewCaption.getParent().layout();
+        }, error -> {
+            if (previewOperation != operation || operation.cancelled.get()) return;
+            previewOperation = null;
+            if (!(error instanceof CancellationException)) preview.setText("Could not preview this conversation:\n" + error.getMessage());
+        });
     }
 
     private void chooseExport() {
-        List<Conversation> selected = selectedConversations();
-        if (selected.isEmpty()) return;
+        var selected = selectedConversations();
+        if (selected.isEmpty() || scanOperation != null || exportOperation != null || closeWhenFinished) return;
         ExportOptions currentOptions = options();
-        var chooser = new JFileChooser();
         boolean single = selected.size() == 1;
-        chooser.setDialogTitle(single ? "Export conversation as Markdown" : "Choose a folder for " + selected.size() + " Markdown files");
-        if (single) {
-            chooser.setFileFilter(new FileNameExtensionFilter("Markdown (*.md)", "md"));
-            chooser.setSelectedFile(new java.io.File(ExportService.filename(selected.getFirst(), currentOptions)));
-        } else chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
-        Path destination = chooser.getSelectedFile().toPath();
-        exportCancelled = new AtomicBoolean();
-        AtomicBoolean cancellation = exportCancelled;
-        exportWorker = new SwingWorker<>() {
-            @Override
-            protected ExportService.BatchResult doInBackground() {
-                var service = new ExportService();
-                return single ? service.exportSingle(selected.getFirst(), destination, currentOptions,
-                        cancellation::get, this::publish)
-                        : service.exportBatch(selected, destination, currentOptions, cancellation::get, this::publish);
-            }
-
-            @Override
-            protected void process(List<String> chunks) {
-                if (exportWorker == this && !cancellation.get()) status.setText(chunks.getLast());
-            }
-
-            @Override
-            protected void done() {
-                try {
-                    var result = get();
-                    status.setText((result.cancelled() ? "Export cancelled. " : "Export complete. ")
-                            + result.exported().size() + " saved, " + result.failures().size() + " failed.");
-                    if (!closeWhenFinished) showText("Export report", report(result));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } catch (ExecutionException e) {
-                    status.setText("Export failed.");
-                    if (!closeWhenFinished) showError("Could not export", e.getCause());
-                } finally {
-                    exportWorker = null;
-                    updateActions();
-                    if (closeWhenFinished) dispose();
-                }
-            }
-        };
+        Path destination = single
+                ? dialogs.chooseMarkdownFile(shell, ExportService.filename(selected.getFirst(), currentOptions))
+                : dialogs.chooseDirectory(shell, "Choose a folder for " + selected.size() + " Markdown files");
+        if (destination == null || shell.isDisposed() || closeWhenFinished) return;
+        var operation = new Operation();
+        exportOperation = operation;
         updateActions();
-        exportWorker.execute();
+        Consumer<String> progress = text -> post(() -> {
+            if (exportOperation == operation && !operation.cancelled.get()) status.setText(text);
+        });
+        submit(() -> {
+            var service = new ExportService();
+            return single ? service.exportSingle(selected.getFirst(), destination, currentOptions, operation.cancelled::get, progress)
+                    : service.exportBatch(selected, destination, currentOptions, operation.cancelled::get, progress);
+        }, result -> {
+            exportOperation = null;
+            status.setText((result.cancelled() ? "Export cancelled. " : "Export complete. ")
+                    + result.exported().size() + " saved, " + result.failures().size() + " failed.");
+            updateActions();
+            if (closeWhenFinished) shell.dispose();
+            else dialogs.showText(shell, "Export report", report(result));
+        }, error -> {
+            exportOperation = null;
+            status.setText("Export failed.");
+            updateActions();
+            if (closeWhenFinished) shell.dispose();
+            else dialogs.showError(shell, "Could not export", error);
+        });
+    }
+
+    private void stopReading() {
+        display.timerExec(-1, previewTimer);
+        cancelContentSearch();
+        if (previewOperation != null) previewOperation.cancelled.set(true);
+        previewOperation = null;
+        if (scanOperation != null) scanOperation.cancelled.set(true);
+    }
+
+    private <T> void submit(Callable<T> work, Consumer<T> completed, Consumer<Exception> failed) {
+        workers.submit(() -> {
+            try {
+                T result = work.call();
+                post(() -> completed.accept(result));
+            } catch (Exception error) {
+                post(() -> failed.accept(error));
+            }
+        });
+    }
+
+    private void post(Runnable callback) {
+        try {
+            display.asyncExec(() -> {
+                if (!shell.isDisposed()) callback.run();
+            });
+        } catch (SWTException error) {
+            if (error.code != SWT.ERROR_DEVICE_DISPOSED) throw error;
+        }
+    }
+
+    private static final class Operation {
+        final AtomicBoolean cancelled = new AtomicBoolean();
     }
 
     private static String report(ExportService.BatchResult result) {
@@ -591,51 +556,4 @@ public final class CodexParserApp extends JFrame {
         return report.toString();
     }
 
-    private void showText(String title, String text) {
-        var area = new JTextArea(text, 18, 80);
-        area.setEditable(false);
-        area.setLineWrap(true);
-        area.setWrapStyleWord(true);
-        area.setCaretPosition(0);
-        var scroll = new JScrollPane(area);
-        scroll.setPreferredSize(new Dimension(780, 400));
-        JOptionPane.showMessageDialog(this, scroll, title, JOptionPane.INFORMATION_MESSAGE);
-    }
-
-    private void showError(String title, Throwable error) {
-        JOptionPane.showMessageDialog(this, error.getMessage(), title, JOptionPane.ERROR_MESSAGE);
-    }
-
-    private static final class ConversationTable extends AbstractTableModel {
-        private List<Conversation> rows = List.of();
-        private ZoneId zone = ZoneId.systemDefault();
-        private static final String[] COLUMNS = {"Conversation", "Started", "Project", "Location"};
-
-        @Override
-        public int getRowCount() {
-            return rows.size();
-        }
-
-        @Override
-        public int getColumnCount() {
-            return COLUMNS.length;
-        }
-
-        @Override
-        public String getColumnName(int column) {
-            return COLUMNS[column];
-        }
-
-        @Override
-        public Object getValueAt(int row, int column) {
-            Conversation conversation = rows.get(row);
-            return switch (column) {
-                case 0 -> conversation.title();
-                case 1 -> MarkdownExporter.timestamp(conversation.startedAt(), zone);
-                case 2 -> conversation.project().isBlank() ? "Unknown" : conversation.project();
-                case 3 -> conversation.archived() ? "Archived" : "Sessions";
-                default -> "";
-            };
-        }
-    }
 }

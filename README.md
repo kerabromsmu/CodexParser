@@ -1,6 +1,6 @@
 # Codex Parser
 
-A Java 27 desktop app for finding local Codex conversations and exporting timestamped Markdown transcripts.
+A Java 27 desktop app for finding local Codex conversations and exporting timestamped Markdown transcripts. The UI uses SWT native platform controls: GTK on Linux, Win32 on Windows, and Cocoa on macOS, with system fonts and colors.
 
 ## Run
 
@@ -10,7 +10,7 @@ Install a **JDK 27** and set `JAVA_HOME` to its installation directory. The proj
 ./gradlew run
 ```
 
-On Windows, use `gradlew.bat run`.
+On Windows, use `gradlew.bat run`. Linux requires GTK 3 and a graphical desktop (including XWayland when running through X11 on a Wayland session). GTK controls work on KDE Plasma; their appearance follows the GTK theme. On macOS, the Gradle tasks and generated launchers supply SWT's required `-XstartOnFirstThread` option.
 
 Create a distribution with launch scripts and all runtime dependencies:
 
@@ -19,7 +19,18 @@ Create a distribution with launch scripts and all runtime dependencies:
 build/install/codex-parser/bin/codex-parser
 ```
 
-The Windows launcher is `build\install\codex-parser\bin\codex-parser.bat`. Launchers require Java 27 on `PATH` or through `JAVA_HOME`. `./gradlew distZip` creates a portable distribution archive. The first build needs network access to download Gradle and dependencies; the app itself works offline.
+The Windows launcher is `build\install\codex-parser\bin\codex-parser.bat`. Launchers require Java 27 on `PATH` or through `JAVA_HOME`. `./gradlew distZip` creates a platform-specific distribution archive. The first build needs network access to download Gradle and dependencies; the app itself works offline.
+
+SWT 3.135.0 includes native libraries for the selected OS and CPU architecture. Gradle defaults to the build machine's platform. Supported targets are `linux-x86_64`, `windows-x86_64`, `macos-x86_64` (Intel), and `macos-aarch64` (Apple Silicon). Build separate archives with:
+
+```bash
+./gradlew distZip -PswtPlatform=linux-x86_64
+./gradlew distZip -PswtPlatform=windows-x86_64
+./gradlew distZip -PswtPlatform=macos-x86_64
+./gradlew distZip -PswtPlatform=macos-aarch64
+```
+
+Archive filenames include the target platform. `installDist` installs the currently selected target into `build/install/codex-parser`; copy each target before installing another. Cross-building archives is supported; `run` and desktop checks require a target matching the build machine. Distributions contain dependencies and launch scripts, and require a separately installed JDK 27; they are not OS installers.
 
 ## Browse and export
 
@@ -50,7 +61,7 @@ Everything mode keeps each original JSONL record, including duplicate representa
 ./gradlew test installDist
 ```
 
-The regular tests use synthetic logs and do not access personal conversations. To test the real Swing selection, preview, timezone, cancellation, and file-dialog workflows, use a graphical desktop:
+The regular tests use synthetic logs and do not access personal conversations. To test the SWT selection, sorting, search, preview, timezone, export, warning, and cancellation workflows, use a graphical desktop:
 
 ```bash
 ./gradlew desktopTest
@@ -62,4 +73,12 @@ Or use a virtual display on Linux:
 xvfb-run -a -s '-screen 0 1600x1000x24' ./gradlew desktopTest
 ```
 
-The desktop test saves a screenshot with synthetic data to `build/desktop-smoke.png`. Test reports are under `build/reports/tests/`.
+Each desktop scenario starts a separate JVM so SWT owns the first thread on macOS. Automated workflow tests inject file/folder choices, including dismissal, while using real SWT controls and asynchronous services. Native report dialogs are tested separately. The desktop test saves a screenshot with synthetic data to `build/desktop-smoke.png`. Test reports are under `build/reports/tests/`.
+
+To check real OS file/folder pickers and system appearance manually on each target OS, run:
+
+```bash
+./gradlew nativeDialogSmoke
+```
+
+This opens the app with synthetic logs under `build/native-smoke`, without reading personal Codex conversations. Check **Add log folder…**, a single-selection export, a multiple-selection export, and dismissal of each picker. Verify the packaged launcher on each target OS as well. Cross-building an archive does not verify its runtime behavior on that OS.

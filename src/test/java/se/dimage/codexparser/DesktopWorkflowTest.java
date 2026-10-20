@@ -56,8 +56,8 @@ class DesktopWorkflowTest {
     @Test
     void browseFilterPreviewTimezoneAndExportUsingDesktopDialogs() throws Exception {
         Path logs = temporary.resolve("logs");
-        compressedFile(logs, "alpha.jsonl.zst", metadata("alpha"), message("user", "Alpha conversation"), message("assistant", "Alpha answer"));
-        file(logs, "beta.jsonl", metadata("beta"), message("user", "Beta conversation"), message("assistant", "Beta answer"));
+        compressedFile(logs, "alpha.jsonl.zst", metadata("alpha"), message("user", "Alpha conversation"), message("assistant", "Alpha answer: foxtrot-body-only"));
+        file(logs, "beta.jsonl", metadata("beta"), message("user", "Beta conversation"), message("assistant", "Beta answer: lima-body-only"));
         Path output = Files.createDirectories(temporary.resolve("exports"));
         app = onEdt(() -> {
             var window = new CodexParserApp(List.of(logs));
@@ -68,6 +68,7 @@ class DesktopWorkflowTest {
         JTable table = onEdt(() -> requireComponent(app, JTable.class, _ -> true));
         JTextArea preview = onEdt(() -> requireComponent(app, JTextArea.class, c -> "preview".equals(c.getName())));
         JTextField search = onEdt(() -> requireComponent(app, JTextField.class, c -> "search".equals(c.getName())));
+        JLabel searchStatus = onEdt(() -> requireComponent(app, JLabel.class, c -> "searchStatus".equals(c.getName())));
         await(() -> table.getRowCount() == 2 && button(app, "Refresh").isEnabled());
         assertFalse(onEdt(() -> button(app, "Export selected…").isEnabled()));
 
@@ -83,6 +84,22 @@ class DesktopWorkflowTest {
         await(() -> preview.getText().contains("Alpha answer"));
         assertFalse(onEdt(() -> preview.getText().contains("Original JSON record")));
         assertTrue(onEdt(() -> button(app, "Export selected…").isEnabled()));
+
+        onEdt(() -> { search.setText("foxtrot-body-only"); return null; });
+        await(() -> searchStatus.getText().startsWith("Search complete") && table.getRowCount() == 1);
+        assertEquals("Alpha conversation", onEdt(() -> table.getValueAt(0, 0)));
+        onEdt(() -> { table.setRowSelectionInterval(0, 0); return null; });
+        await(() -> preview.getText().contains("foxtrot-body-only"));
+
+        onEdt(() -> {
+            search.setText("lima-body-only");
+            search.setText("absent-body-marker");
+            search.setText("foxtrot-body-only");
+            return null;
+        });
+        await(() -> searchStatus.getText().startsWith("Search complete") && table.getRowCount() == 1);
+        assertEquals("Alpha conversation", onEdt(() -> table.getValueAt(0, 0)));
+        onEdt(() -> { table.setRowSelectionInterval(0, 0); return null; });
 
         onEdt(() -> {
             JComboBox<?> mode = requireComponent(app, JComboBox.class,
@@ -144,10 +161,11 @@ class DesktopWorkflowTest {
             }
         }
 
-        onEdt(() -> {
-            table.setRowSelectionInterval(0, 0);
-            return null;
-        });
+        onEdt(() -> { search.setText("lima-body-only"); return null; });
+        await(() -> searchStatus.getText().startsWith("Search complete") && table.getRowCount() == 1);
+        assertEquals("Beta conversation", onEdt(() -> table.getValueAt(0, 0)));
+        onEdt(() -> { table.setRowSelectionInterval(0, 0); return null; });
+        await(() -> preview.getText().contains("lima-body-only"));
         SwingUtilities.invokeLater(() -> button(app, "Export selected…").doClick());
         await(() -> showingChooser() != null);
         onEdt(() -> {
@@ -160,12 +178,28 @@ class DesktopWorkflowTest {
         });
         await(() -> reportDialog() != null);
         assertTrue(Files.exists(output.resolve("single-export.md")));
+        assertTrue(Files.readString(output.resolve("single-export.md")).contains("lima-body-only"));
+        assertFalse(Files.readString(output.resolve("single-export.md")).contains("foxtrot-body-only"));
         onEdt(() -> {
             Dialog dialog = requireReportDialog();
             dialog.dispose();
             return null;
         });
         await(() -> button(app, "Refresh").isEnabled());
+
+        onEdt(() -> { search.setText("fresh-after-refresh"); return null; });
+        await(() -> searchStatus.getText().startsWith("Search complete") && table.getRowCount() == 0);
+        compressedFile(logs, "alpha.jsonl.zst", metadata("alpha"), message("user", "Alpha conversation"),
+                message("assistant", "Alpha answer: foxtrot-body-only; fresh-after-refresh"));
+        onEdt(() -> { button(app, "Refresh").doClick(); return null; });
+        await(() -> button(app, "Refresh").isEnabled() && searchStatus.getText().startsWith("Search complete") && table.getRowCount() == 1);
+        assertEquals("Alpha conversation", onEdt(() -> table.getValueAt(0, 0)));
+        onEdt(() -> {
+            search.setText("");
+            assertEquals(2, table.getRowCount());
+            assertTrue(searchStatus.getText().isBlank());
+            return null;
+        });
 
         var conversationsBeforeCancel = onEdt(() -> List.of(table.getValueAt(0, 0), table.getValueAt(1, 0)));
         onEdt(() -> {

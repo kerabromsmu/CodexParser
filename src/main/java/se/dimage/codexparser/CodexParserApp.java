@@ -39,7 +39,7 @@ import java.nio.file.Path;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -63,14 +63,20 @@ public final class CodexParserApp extends JFrame {
     private final JButton addFolder = new JButton("Add log folder…");
     private final JButton export = new JButton("Export selected…");
     private final JButton cancel = new JButton("Cancel");
-    private final JButton warnings = new JButton("Scan warnings");
+    private final JButton warnings = new JButton("Warnings");
     private final JLabel status = new JLabel("Ready");
     private final JLabel selection = new JLabel("0 selected");
     private final JLabel sources = new JLabel();
+    private final JLabel searchStatus = new JLabel(" ");
     private final JLabel previewCaption = new JLabel("MARKDOWN PREVIEW");
     private final JProgressBar progress = new JProgressBar();
     private final Timer previewTimer;
+    private final Timer searchTimer;
     private List<String> scanWarnings = List.of();
+    private List<String> searchWarnings = List.of();
+    private Set<Path> contentMatches = Set.of();
+    private SwingWorker<ConversationSearch.SearchResult, Void> searchWorker;
+    private AtomicBoolean searchCancelled;
     private SwingWorker<ConversationDiscovery.ScanResult, String> scanWorker;
     private AtomicBoolean scanCancelled;
     private SwingWorker<MarkdownExporter.Preview, Void> previewWorker;
@@ -114,6 +120,8 @@ public final class CodexParserApp extends JFrame {
         setLocationRelativeTo(null);
         previewTimer = new Timer(150, _ -> loadPreview());
         previewTimer.setRepeats(false);
+        searchTimer = new Timer(300, _ -> searchContents());
+        searchTimer.setRepeats(false);
         buildInterface();
         wireActions();
         updateSources();
@@ -122,6 +130,7 @@ public final class CodexParserApp extends JFrame {
             @Override
             public void windowClosing(WindowEvent event) {
                 previewTimer.stop();
+                cancelContentSearch();
                 if (previewWorker != null) previewWorker.cancel(true);
                 if (scanWorker != null) scanCancelled.set(true);
                 if (exportWorker != null) {
@@ -129,6 +138,11 @@ public final class CodexParserApp extends JFrame {
                     exportCancelled.set(true);
                     status.setText("Finishing cancellation before closing…");
                 } else dispose();
+            }
+
+            @Override
+            public void windowClosed(WindowEvent event) {
+                cancelContentSearch();
             }
         });
     }
@@ -173,9 +187,13 @@ public final class CodexParserApp extends JFrame {
         var browse = new JPanel(new BorderLayout(0, 10));
         var filter = new JPanel(new BorderLayout(8, 0));
         filter.add(new JLabel("Search"), BorderLayout.WEST);
-        search.setToolTipText("Filter by conversation title, project, session ID, or source path");
+        search.setToolTipText("Search titles, projects, session IDs, paths, and user/assistant messages (including code)");
         search.setName("search");
         filter.add(search, BorderLayout.CENTER);
+        searchStatus.setName("searchStatus");
+        searchStatus.setFont(searchStatus.getFont().deriveFont(11f));
+        searchStatus.setForeground(new Color(90, 100, 110));
+        filter.add(searchStatus, BorderLayout.SOUTH);
         browse.add(filter, BorderLayout.NORTH);
         browse.add(new JScrollPane(table), BorderLayout.CENTER);
         var listHelp = new JLabel("Ctrl / Cmd + click to select several; Shift + click to select a range.");
@@ -292,21 +310,92 @@ public final class CodexParserApp extends JFrame {
                 cancel.setEnabled(false);
             }
         });
-        warnings.addActionListener(_ -> showText("Scan warnings", String.join("\n", scanWarnings)));
+        warnings.addActionListener(_ -> {
+            var messages = new ArrayList<>(scanWarnings);
+            messages.addAll(searchWarnings);
+            showText("Log warnings", String.join("\n", messages));
+        });
     }
 
     private void filter() {
-        String query = search.getText().strip().toLowerCase(Locale.ROOT);
+        cancelContentSearch();
+        contentMatches = Set.of();
+        searchWarnings = List.of();
+        updateWarnings();
+        applyFilter();
+        if (ConversationSearch.normalizeQuery(search.getText()).isEmpty()) {
+            searchStatus.setText(" ");
+        } else if (scanWorker != null) {
+            searchStatus.setText("Waiting for conversations…");
+        } else {
+            searchStatus.setText("Searching chat contents…");
+            searchTimer.restart();
+        }
+    }
+
+    private void applyFilter() {
+        String query = ConversationSearch.normalizeQuery(search.getText());
+        Set<Path> matches = contentMatches;
         sorter.setRowFilter(new RowFilter<>() {
             @Override
             public boolean include(Entry<? extends ConversationTable, ? extends Integer> entry) {
                 Conversation row = model.rows.get(entry.getIdentifier());
-                return (row.title() + " " + row.project() + " " + row.id() + " " + row.source())
-                        .toLowerCase(Locale.ROOT).contains(query);
+                return ConversationSearch.matchesMetadata(row, query) || matches.contains(row.source());
             }
         });
         updateActions();
         previewTimer.restart();
+    }
+
+    private void cancelContentSearch() {
+        searchTimer.stop();
+        if (searchCancelled != null) searchCancelled.set(true);
+        searchWorker = null;
+    }
+
+    private void searchContents() {
+        String query = ConversationSearch.normalizeQuery(search.getText());
+        if (query.isEmpty() || scanWorker != null || !isDisplayable()) return;
+        List<Conversation> conversations = List.copyOf(model.rows);
+        searchCancelled = new AtomicBoolean();
+        AtomicBoolean cancellation = searchCancelled;
+        searchWorker = new SwingWorker<>() {
+            @Override
+            protected ConversationSearch.SearchResult doInBackground() {
+                return new ConversationSearch().search(conversations, query, cancellation::get);
+            }
+
+            @Override
+            protected void done() {
+                if (searchWorker != this || cancellation.get() || !isDisplayable()) return;
+                try {
+                    var result = get();
+                    contentMatches = result.matches();
+                    searchWarnings = result.warnings();
+                    applyFilter();
+                    searchStatus.setText("Search complete — " + table.getRowCount() + " conversation(s)"
+                            + (searchWarnings.isEmpty() ? "" : "; " + searchWarnings.size() + " warning(s)"));
+                } catch (CancellationException ignored) {
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (ExecutionException e) {
+                    if (!(e.getCause() instanceof CancellationException)) {
+                        searchWarnings = List.of("Content search failed: " + e.getCause().getMessage());
+                        searchStatus.setText("Content search failed; showing metadata matches.");
+                    }
+                } finally {
+                    searchWorker = null;
+                    updateWarnings();
+                }
+            }
+        };
+        searchWorker.execute();
+    }
+
+    private void updateWarnings() {
+        int count = scanWarnings.size() + searchWarnings.size();
+        warnings.setText("Warnings (" + count + ")");
+        warnings.setVisible(count > 0);
     }
 
     private ExportOptions options() {
@@ -338,6 +427,10 @@ public final class CodexParserApp extends JFrame {
 
     private void refreshConversations() {
         if (scanWorker != null || exportWorker != null) return;
+        cancelContentSearch();
+        if (!ConversationSearch.normalizeQuery(search.getText()).isEmpty()) {
+            searchStatus.setText("Waiting for conversations…");
+        }
         status.setText("Finding conversations…");
         var scanRoots = List.copyOf(roots);
         // Keep queued workers runnable so cancellation before startup still reaches done().
@@ -369,8 +462,6 @@ public final class CodexParserApp extends JFrame {
                     model.rows = result.conversations();
                     model.fireTableDataChanged();
                     scanWarnings = result.warnings();
-                    warnings.setText("Scan warnings (" + scanWarnings.size() + ")");
-                    warnings.setVisible(!scanWarnings.isEmpty());
                     status.setText(model.rows.isEmpty() ? "No conversations found. Add a log folder to search elsewhere."
                             : "Found " + model.rows.size() + " conversations. Select one to preview.");
                 } catch (CancellationException e) {
@@ -383,6 +474,7 @@ public final class CodexParserApp extends JFrame {
                 } finally {
                     scanWorker = null;
                     updateActions();
+                    if (isDisplayable()) filter();
                 }
             }
         };

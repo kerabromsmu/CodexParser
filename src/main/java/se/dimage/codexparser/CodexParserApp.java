@@ -1,3 +1,7 @@
+/*
+ * Copyright 2026 Dmitrii Sapelkin (Dimage)
+ * SPDX-License-Identifier: Apache-2.0
+ */
 package se.dimage.codexparser;
 
 import org.eclipse.swt.SWT;
